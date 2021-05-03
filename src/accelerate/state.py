@@ -20,11 +20,31 @@ import torch
 
 
 try:
+    import torch_ccl as ccl
+
+    _ccl_available = True
+except ImportError:
+    _ccl_available = False
+
+
+try:
     import torch_xla.core.xla_model as xm
 
     _tpu_available = True
 except ImportError:
     _tpu_available = False
+
+
+def env2int(env_list, default=-1):
+    for e in env_list:
+        val = int(os.environ.get(e, -1))
+        if val >= 0:
+            return val
+    return default
+
+
+def is_ccl_available():
+    return _ccl_available
 
 
 def is_tpu_available():
@@ -43,12 +63,14 @@ class DistributedType(str, Enum):
     Values:
 
         - **NO** -- Not a distributed environment, just a single process.
+        - **MULTI_CPU** -- Distributed on multiple CPU nodes.
         - **MULTI_GPU** -- Distributed on multiple GPUs.
         - **TPU** -- Distributed on TPUs.
     """
 
     # Subclassing str as well as Enum allows the `DistributedType` to be JSON-serializable out of the box.
     NO = "NO"
+    MULTI_CPU = "MULTI_CPU"
     MULTI_GPU = "MULTI_GPU"
     TPU = "TPU"
 
@@ -107,6 +129,7 @@ class AcceleratorState:
     def __init__(self, fp16: bool = None, cpu: bool = False, _from_accelerator: bool = False):
         self.__dict__ = self._shared_state
         if not getattr(self, "initialized", False):
+            self.backend = None
             if not _from_accelerator:
                 raise ValueError(
                     "Please make sure to properly initialize your accelerator via `accelerator = Accelerator()` "
@@ -123,12 +146,43 @@ class AcceleratorState:
                 self.distributed_type = DistributedType.MULTI_GPU
                 if not torch.distributed.is_initialized():
                     torch.distributed.init_process_group(backend="nccl")
+                    self.backend = "nccl"
                 self.num_processes = torch.distributed.get_world_size()
                 self.process_index = torch.distributed.get_rank()
                 self.local_process_index = int(os.environ.get("LOCAL_RANK", -1))
                 self.device = torch.device("cuda", self.local_process_index)
                 torch.cuda.set_device(self.device)
                 self.use_fp16 = parse_flag_from_env("USE_FP16", False) if fp16 is None else fp16
+            elif env2int(["PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "MV2_COMM_WORLD_SIZE", "WORLD_SIZE"]) > 1:
+                self.distributed_type = DistributedType.MULTI_CPU
+                if is_ccl_available() and env2int(["CCL_WORKER_COUNT"]) > 0:
+                    backend = "ccl"
+                elif torch.distributed.is_mpi_available():
+                    backend = "mpi"
+                else:
+                    backend = "gloo"
+                rank = env2int(["RANK", "PMI_RANK", "OMPI_COMM_WORLD_RANK", "MV2_COMM_WORLD_RANK"], 0)
+                size = env2int(["WORLD_SIZE", "PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "MV2_COMM_WORLD_SIZE"], 1)
+                local_rank = env2int(["LOCAL_RANK", "MPI_LOCALRANKID", "OMPI_COMM_WORLD_LOCAL_RANK", "MV2_COMM_WORLD_LOCAL_RANK"], 0)
+                local_size = env2int(["MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE", "MV2_COMM_WORLD_LOCAL_SIZE"], 1)
+                self.local_process_index = local_rank
+                os.environ["RANK"] = str(rank)
+                os.environ["WORLD_SIZE"] = str(size)
+                if not os.environ.get("MASTER_PORT", None): os.environ["MASTER_PORT"] = "29500"
+                if not os.environ.get("MASTER_ADDR", None):
+                    if local_size != size and backend != "mpi":
+                        print("Warning: Looks like distributed multinode run but MASTER_ADDR env not set, using '127.0.0.1' as default")
+                        print("If this run hangs, try exporting rank 0's hostname as MASTER_ADDR")
+                        os.environ["MASTER_ADDR"] = "127.0.0.1"
+                if not torch.distributed.is_initialized():
+                    torch.distributed.init_process_group(backend, rank=rank, world_size=size)
+                    self.backend = backend
+                self.num_processes = torch.distributed.get_world_size()
+                self.process_index = torch.distributed.get_rank()
+                self.local_process_index = local_rank
+                self.local_num_processes = local_size
+                self.device = torch.device("cpu")
+                self.use_fp16 = False
             else:
                 self.distributed_type = DistributedType.NO
                 self.num_processes = 1
@@ -139,7 +193,7 @@ class AcceleratorState:
 
     def __repr__(self):
         return (
-            f"Distributed environment: {self.distributed_type}\n"
+            f"Distributed environment: {self.distributed_type}  Backend: {self.backend}\n"
             f"Num processes: {self.num_processes}\n"
             f"Process index: {self.process_index}\n"
             f"Local process index: {self.local_process_index}\n"

@@ -80,6 +80,8 @@ def synchronize_rng_state(rng_type: Optional[RNGType] = None, generator: Optiona
         rng_state = rng_state.to(state.device)
         torch.distributed.broadcast(rng_state, 0)
         rng_state = rng_state.cpu()
+    elif state.distributed_type == DistributedType.MULTI_CPU:
+        torch.distributed.broadcast(rng_state, 0)
 
     # Set the broadcast rng state
     if rng_type == RNGType.TORCH:
@@ -155,6 +157,7 @@ def _gpu_gather(tensor):
     torch.distributed.all_gather(output_tensors, tensor)
     return torch.cat(output_tensors, dim=0)
 
+_cpu_gather = _gpu_gather
 
 def gather(tensor):
     """
@@ -171,6 +174,8 @@ def gather(tensor):
         return _tpu_gather(tensor, name="accelerate.utils.gather")
     elif AcceleratorState().distributed_type == DistributedType.MULTI_GPU:
         return _gpu_gather(tensor)
+    elif AcceleratorState().distributed_type == DistributedType.MULTI_CPU:
+        return _cpu_gather(tensor)
     else:
         return tensor
 
@@ -230,7 +235,7 @@ def wait_for_everyone():
 
         Make sure all processes will reach this instruction otherwise one of your processes will hang forever.
     """
-    if AcceleratorState().distributed_type == DistributedType.MULTI_GPU:
+    if AcceleratorState().distributed_type == DistributedType.MULTI_GPU or AcceleratorState().distributed_type == DistributedType.MULTI_CPU:
         torch.distributed.barrier()
     elif AcceleratorState().distributed_type == DistributedType.TPU:
         xm.rendezvous("accelerate.utils.wait_for_everyone")
@@ -266,7 +271,7 @@ class PrepareForLaunch:
         self.distributed_type = DistributedType(distributed_type)
 
     def __call__(self, index, *args):
-        if self.distributed_type == DistributedType.MULTI_GPU:
+        if self.distributed_type == DistributedType.MULTI_GPU or self.distributed_type == DistributedType.MULTI_CPU:
             # Prepare the environment for torch.distributed
             os.environ["LOCAL_RANK"] = str(index)
             os.environ["RANK"] = str(index)
